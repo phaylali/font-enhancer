@@ -42,10 +42,11 @@ This document provides in-depth technical details about Font Enhancer for develo
 
 ```
 font-enhancer/
-├── main.py              # Application entry, logging setup
+├── main.py              # Application entry, CLI args, logging setup
 ├── gui.py               # PyQt6 MainWindow and UI components
 ├── kerner.py            # Auto-kerning algorithm
-├── preview_renderer.py  # Harfbuzz + Freetype rendering
+├── preview_renderer.py  # Freetype rendering
+├── run.sh               # Launcher script using uv
 ├── requirements.txt     # Python dependencies (UV compatible)
 ├── README.md            # User-facing documentation
 └── DEV_NOTES.md         # This file
@@ -59,6 +60,34 @@ main.py
        ├─> kerner.py (auto_kern, KerningResult)
        └─> preview_renderer.py (PreviewFontFace, PreviewRenderer)
 ```
+
+### CLI Usage
+
+```bash
+# Interactive mode
+python main.py
+
+# Open UFO font directly
+python main.py --font=/path/to/font.ufo/
+
+# Open and auto-kern
+python main.py --font=/path/to/font.ufo/ --auto-kern
+
+# Specify test string
+python main.py --font=/path/to/font.ufo/ --preview="Hello World"
+
+# Export after processing
+python main.py --font=/path/to/font.ufo/ --export=/output/font.otf
+```
+
+### Command Line Arguments
+
+| Argument | Description |
+|----------|-------------|
+| `--font`, `-f` | Path to UFO font directory |
+| `--auto-kern`, `-k` | Auto-run kerning after load |
+| `--export` | Export path (UFO or OTF) |
+| `--preview` | Test string for preview |
 
 ---
 
@@ -154,32 +183,26 @@ These can be extended for additional scripts (Arabic, Cyrillic, Greek) by creati
    - Load `.otf`/`.ttf` directly via `freetype-py`
    - Load `.ufo` by compiling to temporary TTF using `ufo2ft`
 
-2. **Text Shaping** (harfbuzz):
-   - Create harfbuzz buffer with Unicode text
-   - Set direction (LTR or RTL)
-   - Apply shaping with kern feature enabled
-   - Retrieve glyph positions and advances
-
-3. **Kern Application**:
-   - After shaping, apply manual kern adjustments
-   - Modify `x_advance` of each glyph based on kern_pairs dict
-   - Scale by `kern_strength` (-1.0 to 1.0)
-
-4. **Rasterization** (freetype-py):
+2. **Text Rendering** (freetype-py):
    - Set font size (in points)
-   - Load each glyph and render bitmap
+   - Iterate through characters and load each glyph
+   - Get glyph advance and bitmap
    - Convert FT bitmap to QImage
-   - Compose with foreground color using Qt painter
 
-5. **Guide Overlay** (optional):
-   - Draw dashed vertical lines at sidebearing edges
-   - Draw solid markers at kern pair boundaries
+3. **Color Composition**:
+   - Create ARGB32 QImage
+   - Use Qt painter with CompositionMode_SourceIn to tint glyphs
+
+4. **Note on Harfbuzz**:
+   - Harfbuzz integration was removed due to API compatibility issues
+   - Basic LTR rendering works with simple character iteration
+   - RTL/Arabic shaping would require additional setup
 
 ### Key Classes
 
 ```python
 class PreviewFontFace:
-    """Wraps freetype face + harfbuzz blob."""
+    """Wraps freetype face for rendering."""
     
     @classmethod
     def from_file(cls, path: str) -> "PreviewFontFace"
@@ -190,7 +213,7 @@ class PreviewFontFace:
         """Compile UFO to TTF, then load."""
 
 class PreviewRenderer:
-    """High-level renderer combining shaping + rendering."""
+    """High-level renderer for text preview."""
     
     @property
     def kern_pairs: dict[tuple[str, str], float]
@@ -199,10 +222,10 @@ class PreviewRenderer:
     def kern_strength: float  # -1.0 to 1.0
     
     @property
-    def direction: str  # "ltr" or "rtl"
-    
-    @property
     def font_size: float
+    
+    def render(...) -> QImage
+        """Render text to QImage."""
     
     def render(...) -> QImage
         """Shape and render text to QImage."""
