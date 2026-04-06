@@ -1,0 +1,10 @@
+PyQt6>=6.4.0
+fonttools>=4.38.0
+ufoLib2>=0.14.0
+defcon>=0.10.0
+freetype-py>=2.3.0
+uharfbuzz>=0.37.0
+booleanOperations>=0.9.0
+cu2qu>=1.6.0
+compreffor>=0.5.0
+ufo2ft>=2.0.0
