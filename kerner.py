@@ -10,12 +10,16 @@ All algorithms are open-source and require no external APIs.
 
 from __future__ import annotations
 
+import logging
 import math
 from dataclasses import dataclass, field
 from typing import Optional
 
 from ufoLib2 import Font
 from defcon import Glyph
+
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -404,13 +408,33 @@ def auto_kern(
     # Step 1: extract metrics
     metrics: dict[str, GlyphMetrics] = {}
     layer = font.layers.get("public.default", None)
-    if layer:
+
+    if layer is None or len(list(layer.keys())) == 0:
+        # Fallback: try any layer that has glyphs
+        available_layers = list(font.layers)
+        logger.warning(
+            "'public.default' layer not found or empty. "
+            f"Available layers: {[l.name for l in available_layers]}. "
+            "Falling back to first non-empty layer."
+        )
+        for fallback_layer in available_layers:
+            if len(list(fallback_layer.keys())) > 0:
+                layer = fallback_layer
+                logger.info(f"Using layer: '{layer.name}' as fallback.")
+                break
+
+    if layer is not None:
         for glyph_name in layer.keys():
             glyph = layer[glyph_name]
             if len(glyph) > 0:  # only glyphs with contours
                 metrics[glyph.name] = extract_metrics(glyph)
 
     if not metrics:
+        logger.warning(
+            "No glyphs with contours found in any layer. "
+            "Ensure your UFO font has drawn glyph outlines. "
+            "Auto-kerning cannot proceed with an empty or component-only font."
+        )
         return KerningResult()
 
     # Step 2: classify

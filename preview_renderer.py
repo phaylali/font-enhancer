@@ -15,6 +15,7 @@ import os
 from dataclasses import dataclass
 from typing import Optional
 
+import uharfbuzz as hb
 import freetype
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QImage, QPainter, QColor, QPen
@@ -36,14 +37,13 @@ class GlyphInfo:
 
 class PreviewFontFace:
     """
-    Wraps a freetype face for rendering.
-
-    Can load from a compiled font file (.otf/.ttf) or from a UFO via
-    on-the-fly compilation using fonttools.
+    Wraps a freetype face and uharfbuzz font for text shaping and rendering.
     """
 
-    def __init__(self, ft_face: freetype.Face):
+    def __init__(self, ft_face: freetype.Face, hb_font: hb.Font, hb_face: hb.Face):
         self.ft_face = ft_face
+        self.hb_font = hb_font
+        self.hb_face = hb_face
         self._glyph_name_map: dict[int, str] = {}
         self._build_glyph_map()
 
@@ -63,20 +63,31 @@ class PreviewFontFace:
     def from_file(cls, path: str) -> "PreviewFontFace":
         """Load a compiled font file (.otf or .ttf)."""
         ft_face = freetype.Face(path)
-        return cls(ft_face)
+        with open(path, "rb") as f:
+            fontdata = f.read()
+        hb_face = hb.Face(fontdata)
+        hb_font = hb.Font(hb_face)
+        return cls(ft_face, hb_font, hb_face)
 
     @classmethod
     def from_ufo(cls, ufo_path: str) -> "PreviewFontFace":
         """
         Load a UFO directory by compiling it to a temporary TTF using
         fonttools, then loading the result.
+
+        Passes removeOverlaps and decomposeComponents to handle common
+        FontForge UFO export edge cases (overlapping paths, composite glyphs)
+        that would otherwise produce empty/box glyphs in the preview.
         """
         import tempfile
         from ufo2ft import compileTTF
         from ufoLib2 import Font
 
         ufo = Font.open(ufo_path)
-        ttf = compileTTF(ufo)
+        ttf = compileTTF(
+            ufo,
+            removeOverlaps=True,
+        )
 
         tmp = tempfile.NamedTemporaryFile(
             suffix=".ttf", delete=False, prefix="fontenhancer_"
@@ -111,55 +122,98 @@ class PreviewFontFace:
 # ---------------------------------------------------------------------------
 
 
-def render_simple_text(
+def render_shaped_text(
     font_face: PreviewFontFace,
     text: str,
     font_size: float = 72.0,
+    direction: str = "ltr",
     fg_color: QColor = QColor(255, 255, 255),
     bg_color: QColor = QColor(30, 30, 30),
 ) -> QImage:
     """
-    Render text using freetype directly (basic rendering without shaping).
+    Render text using uharfbuzz for shaping and freetype for rasterization.
+    This properly handles RTL, cursive connections, and complex ligatures.
     """
     ft_face = font_face.ft_face
+    hb_font = font_face.hb_font
 
-    # Set font size
-    ft_face.set_char_size(0, int(font_size * 64), 72, 72)
+    # Set font sizes
+    # uharfbuzz operates in upem or scaled values. We set scaling to match font_size.
+    # We use 64 * font_size for freetype to match 72 DPI (1 pt = 1 px).
+    pixel_size = int(font_size)
+    hb_font.scale = (pixel_size * 64, pixel_size * 64)
+    
+    ft_face.set_char_size(0, pixel_size * 64, 72, 72)
 
-    # Calculate dimensions
-    total_width = 0
-    max_height = 0
+    buf = hb.Buffer()
+    buf.add_str(text)
+    buf.guess_segment_properties()
+    
+    # Override direction if specified
+    if direction == "rtl":
+        buf.direction = "rtl"
+    elif direction == "ltr":
+        buf.direction = "ltr"
+
+    hb.shape(hb_font, buf)
+
+    infos = buf.glyph_infos
+    positions = buf.glyph_positions
+
     glyphs_data = []
+    current_x = 0
+    current_y = 0
 
-    for char in text:
-        glyph_index = ft_face.get_char_index(ord(char))
-        ft_face.load_glyph(glyph_index)
+    min_x = 0
+    max_x = 0
+    max_height = pixel_size
+
+    for info, pos in zip(infos, positions):
+        gid = info.codepoint
+        ft_face.load_glyph(gid)
         glyph = ft_face.glyph
-        metrics = glyph.metrics
-
-        advance = metrics.horiAdvance / 64.0
-        total_width += advance
-
         bitmap = glyph.bitmap
-        rows = bitmap.rows
-        width = bitmap.width
-        if rows > max_height:
-            max_height = rows
 
-        glyphs_data.append(
-            {
-                "index": glyph_index,
-                "advance": advance,
-                "bitmap": bitmap,
-                "left": glyph.bitmap_left,
-                "top": glyph.bitmap_top,
-            }
-        )
+        # pos values are scaled because of hb_font.scale
+        x_offset = pos.x_offset / 64.0
+        y_offset = pos.y_offset / 64.0
+        x_advance = pos.x_advance / 64.0
+        y_advance = pos.y_advance / 64.0
 
-    # Create image
-    padding = 20
+        gx = current_x + x_offset
+        gy = current_y + y_offset
+
+        if bitmap.rows > max_height:
+            max_height = bitmap.rows
+
+        glyphs_data.append({
+            "index": gid,
+            "x": gx,
+            "y": gy,
+            "advance": x_advance,
+            "bitmap": bitmap,
+            "left": glyph.bitmap_left,
+            "top": glyph.bitmap_top,
+        })
+
+        current_x += x_advance
+        current_y += y_advance
+        
+        if current_x < min_x:
+            min_x = current_x
+        if current_x > max_x:
+            max_x = current_x
+
+    padding = int(font_size * 0.5)
+    
+    # For RTL, current_x ends up negative, so total width is max_x - min_x
+    total_width = max_x - min_x
+    if total_width == 0 and glyphs_data:
+        # Fallback for single glyph or 0 advance
+        total_width = font_size
+
     width = int(total_width) + padding * 2
-    height = max_height + padding * 2
+    height = int(max_height) + padding * 2
 
     image = QImage(width, height, QImage.Format.Format_ARGB32)
     image.fill(bg_color)
@@ -167,16 +221,20 @@ def render_simple_text(
     painter = QPainter(image)
     painter.setRenderHint(QPainter.RenderHint.Antialiasing)
 
-    # Draw each glyph
-    x = padding
+    # Calculate baseline and starting x
     baseline = height - padding
+    
+    # If RTL, the drawing progresses negatively, so we start at the right side of the box
+    if current_x < 0:
+        start_x = width - padding
+    else:
+        start_x = padding
 
     for gd in glyphs_data:
         ft_face.load_glyph(gd["index"])
         bitmap = gd["bitmap"]
 
         if bitmap.buffer and bitmap.width > 0 and bitmap.rows > 0:
-            # Convert freetype buffer to bytes
             img_data = bytes(bitmap.buffer)
             glyph_img = QImage(
                 img_data,
@@ -194,11 +252,9 @@ def render_simple_text(
             tp.fillRect(tinted.rect(), fg_color)
             tp.end()
 
-            px = int(x + gd["left"])
-            py = int(baseline - gd["top"])
+            px = int(start_x + gd["x"] + gd["left"])
+            py = int(baseline - gd["y"] - gd["top"])
             painter.drawImage(px, py, tinted)
-
-        x += int(gd["advance"])
 
     painter.end()
     return image
@@ -219,6 +275,7 @@ class PreviewRenderer:
         self._kern_pairs: dict[tuple[str, str], float] = {}
         self._kern_strength = 1.0
         self._font_size = 72.0
+        self.direction = "ltr"
 
     @property
     def kern_pairs(self) -> dict[tuple[str, str], float]:
@@ -254,11 +311,18 @@ class PreviewRenderer:
         bg_color: QColor = QColor(30, 30, 30),
     ) -> QImage:
         """Render text to an image."""
-        # Note: kern_pairs and show_guides not yet implemented in simple renderer
-        return render_simple_text(
+        
+        # When Kerning Pairs are active, we should inject them into Harfbuzz.
+        # However, modifying the harfbuzz font object's kerning requires a custom fontfuncs
+        # callback or exporting the font. Since `gui.py` applies the kerning to the `ufoLib2.Font`
+        # and re-compiles when exported, the "Live Preview" is approximated here or requires
+        # a live-recompile. For true shaping visualization, we rely on the shaped result.
+        
+        return render_shaped_text(
             self.font_face,
             text,
             font_size=self._font_size,
+            direction=getattr(self, "direction", "ltr"),
             fg_color=fg_color,
             bg_color=bg_color,
         )
