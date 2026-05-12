@@ -30,63 +30,36 @@ logger = logging.getLogger(__name__)
 # These serve as starting points; the auto-classifier refines them using
 # actual metric data from the loaded UFO.
 LATIN_LEFT_CLASSES: dict[str, list[str]] = {
-    "O_left": ["O", "C", "Q", "G", "D", "c", "e", "o", "d", "q", "g"],
-    "V_left": ["V", "W", "Y", "v", "w", "y", "K", "X", "x", "k"],
-    "H_left": [
-        "H",
-        "I",
-        "B",
-        "E",
-        "F",
-        "L",
-        "T",
-        "J",
-        "h",
-        "b",
-        "l",
-        "f",
-        "i",
-        "j",
-        "t",
-        "r",
-        "n",
-        "m",
-        "p",
-        "u",
-    ],
-    "A_left": ["A", "N", "M", "Z", "S", "a", "n", "m", "z", "s"],
-    "R_left": ["R", "P", "a"],
-    "slash_left": ["slash", "backslash", "f", "/"],
+    "O_left": ["O", "C", "Q", "G", "D"],
+    "o_left": ["c", "e", "o", "d", "q", "g"],
+    "H_left": ["H", "I", "B", "E", "M", "N"],
+    "h_left": ["h", "b", "l", "i", "m", "n", "p", "r", "u"],
+    "V_left": ["V", "W", "Y"],
+    "v_left": ["v", "w", "y"],
+    "A_left": ["A"],
+    "a_left": ["a"],
+    "T_left": ["T"],
+    "F_left": ["F"],
+    "P_left": ["P"],
+    "L_left": ["L"],
+    "R_left": ["R"],
+    "K_left": ["K", "k", "X", "x"],
+    "slash_left": ["slash", "backslash", "/"],
 }
 
 LATIN_RIGHT_CLASSES: dict[str, list[str]] = {
-    "O_right": ["O", "C", "Q", "G", "D", "c", "e", "o", "b", "p", "d", "q"],
-    "V_right": ["V", "W", "Y", "v", "w", "y", "A", "X", "x", "K", "k"],
-    "H_right": [
-        "H",
-        "I",
-        "B",
-        "E",
-        "F",
-        "L",
-        "T",
-        "J",
-        "h",
-        "b",
-        "l",
-        "f",
-        "i",
-        "j",
-        "t",
-        "r",
-        "n",
-        "m",
-        "p",
-        "u",
-    ],
-    "A_right": ["A", "N", "M", "Z", "S", "a", "n", "m", "z", "s"],
-    "R_right": ["R", "P"],
-    "slash_right": ["slash", "backslash", "f", "/"],
+    "O_right": ["O", "C", "Q", "G"],
+    "o_right": ["c", "e", "o", "b", "p", "d", "q"],
+    "H_right": ["H", "I", "B", "E", "F", "D", "M", "N", "P", "R"],
+    "h_right": ["h", "l", "i", "m", "n", "u"],
+    "V_right": ["V", "W", "Y"],
+    "v_right": ["v", "w", "y"],
+    "A_right": ["A"],
+    "a_right": ["a", "s"],
+    "T_right": ["T"],
+    "J_right": ["J", "j"],
+    "K_right": ["K", "k", "X", "x"],
+    "slash_right": ["slash", "backslash", "/"],
 }
 
 
@@ -238,6 +211,8 @@ def _class_centroid(metrics_list: list[GlyphMetrics]) -> GlyphMetrics:
 def compute_pair_kern(
     left: GlyphMetrics,
     right: GlyphMetrics,
+    left_cls: str,
+    right_cls: str,
     min_kern: float = -200,
     max_kern: float = 200,
 ) -> float:
@@ -250,14 +225,18 @@ def compute_pair_kern(
     kern to tighten.  An overlap means they collide → positive kern to loosen.
 
     Formula:
-        gap = right.left_sb - left.right_sb
-        kern = -gap * weight
+        real_gap = left.right_sb + right.left_sb
+        ideal_gap = (left.advance_width + right.advance_width) * 0.08
+        kern = ideal_gap - real_gap
 
     The weight is modulated by the relative sizes of the glyphs so that
     narrow-narrow pairs get less adjustment than wide-wide pairs.
     """
-    # Visual gap between glyphs at default spacing
-    gap = right.left_sb - left.right_sb
+    # Actual bounding-box gap if placed side by side
+    real_gap = left.right_sb + right.left_sb
+    
+    # Heuristic for an ideal comfortable spacing based on glyph widths
+    ideal_gap = (left.advance_width + right.advance_width) * 0.08
 
     # Optical weight factor: larger glyphs need more adjustment
     avg_area = (left.contour_area + right.contour_area) / 2
@@ -267,8 +246,31 @@ def compute_pair_kern(
     else:
         size_factor = 0.5
 
-    # Base kern value: close the gap proportionally
-    kern = -gap * (0.5 + 0.5 * size_factor)
+    # Base kern value: adjust towards ideal gap proportionally
+    kern = (ideal_gap - real_gap) * (0.5 + 0.5 * size_factor)
+
+    # Tucking heuristics for specific Latin class pairs
+    tuck = 0.0
+    
+    # Uppercase tucking into lowercase (overcoming the empty space under arms)
+    if left_cls in ["T_left", "V_left", "Y_left", "W_left", "F_left", "P_left"]:
+        if right_cls in ["a_right", "o_right", "e_right", "c_right", "q_right", "u_right", "s_right"]:
+            tuck = -160.0
+        elif right_cls in ["v_right", "w_right", "y_right", "comma", "period"]:
+            tuck = -120.0
+            
+    # L tucking under T, V, Y, W
+    if left_cls == "L_left" and right_cls in ["T_right", "V_right", "Y_right", "W_right"]:
+        tuck = -180.0
+        
+    # A tucking with T, V, Y, W
+    if left_cls == "A_left" and right_cls in ["T_right", "V_right", "Y_right", "W_right"]:
+        tuck = -160.0
+    if left_cls in ["T_left", "V_left", "Y_left", "W_left"] and right_cls == "A_right":
+        tuck = -160.0
+
+    # Add the tuck adjustment
+    kern += tuck
 
     # Clamp to user-defined range
     kern = max(min_kern, min(max_kern, kern))
@@ -305,7 +307,7 @@ def compute_class_kerning(
 
     for l_cls, l_centroid in left_centroids.items():
         for r_cls, r_centroid in right_centroids.items():
-            value = compute_pair_kern(l_centroid, r_centroid, min_kern, max_kern)
+            value = compute_pair_kern(l_centroid, r_centroid, l_cls, r_cls, min_kern, max_kern)
             # Skip near-zero values to keep the kern table small
             if abs(value) < 1.0:
                 continue
@@ -388,6 +390,24 @@ class KerningResult:
     metrics: dict[str, GlyphMetrics] = field(default_factory=dict)
 
 
+def is_latin_glyph(glyph: Glyph) -> bool:
+    """Check if a glyph belongs to the Latin script or general punctuation."""
+    if not glyph.unicodes:
+        # Check name for unencoded glyphs
+        gn = glyph.name.lower()
+        if "arab" in gn or "tifinagh" in gn:
+            return False
+        import re
+        if re.match(r'^[a-z]+$', gn) or gn in ["period", "comma", "hyphen", "space", "exclam", "question"]:
+            return True
+        return False
+        
+    for u in glyph.unicodes:
+        # Basic Latin, Latin-1, Latin Extended A & B, General Punctuation
+        if u <= 0x024F or (0x2000 <= u <= 0x206F):
+            return True
+    return False
+
 def auto_kern(
     font: Font,
     min_kern: float = -200,
@@ -426,7 +446,7 @@ def auto_kern(
     if layer is not None:
         for glyph_name in layer.keys():
             glyph = layer[glyph_name]
-            if len(glyph) > 0:  # only glyphs with contours
+            if len(glyph) > 0 and is_latin_glyph(glyph):  # only Latin glyphs with contours
                 metrics[glyph.name] = extract_metrics(glyph)
 
     if not metrics:

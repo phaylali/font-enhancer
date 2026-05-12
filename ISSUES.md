@@ -166,6 +166,21 @@ This returns an empty result with no log message. The GUI logs "Generated 0 kern
 
 ---
 
+## Issue 9: Autokerning Base Formula Causes Massive Gaps
+
+**Severity:** Critical  
+**Status:** ✅ Fixed  
+
+**Symptom:** Kerning between specific characters (like `W`/`a`, `T`/`a`, `Y`/`s`) creates immense gaps instead of naturally tucking them closer together.
+
+**Root Cause:** `kerner.py` computed the visual gap using `gap = right.left_sb - left.right_sb`. For glyphs with large bounding box sidebearings under their extended arms (like `W` or `T`), this calculation incorrectly produced a negative value. The engine erroneously believed the glyphs were overlapping and applied positive kerning, pushing them drastically apart. Furthermore, the kerning heuristics did not apply strong enough tucks to properly overcome the bounding-box limitations of these glyphs.
+
+**Location:** `kerner.py`
+
+**Fix applied:** The kerning gap calculation in `kerner.py` was fixed to correctly measure the space between bounding boxes (`real_gap = left.right_sb + right.left_sb`) and properly adjust towards a proportional `ideal_gap`. Tucking heuristic values were dramatically increased (up to -180 units) for uppercase letters (`T`, `W`, `Y`, `V`) followed by lowercase letters (like `a`, `e`, `o`, `s`) to create proper optical tucks. Additionally, an `is_latin_glyph` filter was implemented to strictly limit the automated kerning engine to Latin and common punctuation, effectively omitting Arabic and Tifinagh as requested.
+
+---
+
 ## Summary Table
 
 | # | Issue | Severity | Status | Root Cause File |
@@ -178,3 +193,4 @@ This returns an empty result with no log message. The GUI logs "Generated 0 kern
 | 6 | Missing ufo2ft compile options | Medium | ✅ Fixed | `preview_renderer.py`, `gui.py` |
 | 7 | Silent kerning failure | Medium | ✅ Fixed | `kerner.py`, `gui.py` |
 | 8 | Thread safety risk | Medium | Open (no crash yet) | `gui.py` |
+| 9 | Autokerning formula causes massive gaps | Critical | ✅ Fixed | `kerner.py` |
