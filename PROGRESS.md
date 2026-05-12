@@ -181,6 +181,25 @@ This returns an empty result with no log message. The GUI logs "Generated 0 kern
 
 ---
 
+## Issue 10: Inaccurate Kerning for Complex Latin Shapes (T, V, A, W, L)
+
+**Severity:** Medium  
+**Status:** ✅ Fixed  
+
+**Symptom:** Manual tuck heuristics were required to fix gaps in shapes like `T/a` or `V/A` because the algorithm only looked at a single bounding-box sidebearing. This was brittle and didn't scale well to all Latin characters.
+
+**Root Cause:** `kerner.py` used a single `real_gap = left.right_sb + right.left_sb` based on extreme bounding box boundaries. This ignored the negative space under arms or above slants.
+
+**Fix applied:** Implemented a **6-point profile-based kerning engine**.
+- **Metric Extraction:** `extract_zone_profile()` divides each glyph's bounding box into three equal vertical zones (top, center, bottom) and finds the leftmost/rightmost ink X in each.
+- **Algorithm:** `compute_pair_kern()` now calculates the gap at each of these three zones. It uses a weighted zone gap (25% top, 50% center, 25% bottom) compared against the baseline sidebearing gap.
+- **Clustering:** `_metric_distance()` now includes profile shape deltas in its Euclidean distance calculation, leading to better glyph classes.
+- **Visual Overlay:** Added a matching 6-point dot overlay in `preview_renderer.py` (activated by "Show Guides") to let designers verify the anchor points used by the engine.
+
+**Location:** `kerner.py`, `preview_renderer.py`
+
+---
+
 ## Summary Table
 
 | # | Issue | Severity | Status | Root Cause File |
@@ -194,3 +213,4 @@ This returns an empty result with no log message. The GUI logs "Generated 0 kern
 | 7 | Silent kerning failure | Medium | ✅ Fixed | `kerner.py`, `gui.py` |
 | 8 | Thread safety risk | Medium | Open (no crash yet) | `gui.py` |
 | 9 | Autokerning formula causes massive gaps | Critical | ✅ Fixed | `kerner.py` |
+| 10 | Inaccurate Kerning for Complex Shapes | Medium | ✅ Fixed | `kerner.py` |
