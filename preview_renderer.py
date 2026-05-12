@@ -18,7 +18,7 @@ from typing import Optional
 import uharfbuzz as hb
 import freetype
 from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QImage, QPainter, QColor, QPen
+from PyQt6.QtGui import QImage, QPainter, QColor, QPen, QBrush
 
 
 @dataclass
@@ -28,6 +28,69 @@ class GlyphInfo:
     glyph_id: int
     glyph_name: str
     advance_width: float
+
+
+# ---------------------------------------------------------------------------
+# Latin character detection
+# ---------------------------------------------------------------------------
+
+
+def is_latin_character(char: str) -> bool:
+    """
+    Return True if *char* belongs to Basic Latin (U+0000–U+007F) or
+    Latin-1 Supplement (U+0080–U+00FF).
+
+    These are the only ranges for which the 6-point kerning anchor overlay
+    is drawn, matching the is_latin_glyph() filter in kerner.py.
+    """
+    if not char:
+        return False
+    return ord(char[0]) <= 0x00FF
+
+
+def draw_kerning_anchor_points(
+    painter: QPainter,
+    left_x: int,
+    right_x: int,
+    top_y: int,
+    bottom_y: int,
+    color: QColor = QColor(255, 80, 80, 200),
+    radius: int = 3,
+) -> None:
+    """
+    Draw the 6 kerning reference anchor dots for one glyph.
+
+    Dots are placed at the **ink bounding-box edges** (not advance-width
+    edges) so designers can judge the actual optical gap between glyphs:
+
+      Left edge  → top-left,   center-left,  bottom-left
+      Right edge → top-right,  center-right, bottom-right
+
+    Args:
+        painter:  Active QPainter on the preview image.
+        left_x:   X pixel of the left ink edge.
+        right_x:  X pixel of the right ink edge.
+        top_y:    Y pixel of the topmost ink row.
+        bottom_y: Y pixel of the bottommost ink row.
+        color:    Dot fill color (default: soft red, semi-transparent).
+        radius:   Dot radius in pixels.
+    """
+    center_y = (top_y + bottom_y) // 2
+    anchor_points = [
+        (left_x,  top_y),
+        (left_x,  center_y),
+        (left_x,  bottom_y),
+        (right_x, top_y),
+        (right_x, center_y),
+        (right_x, bottom_y),
+    ]
+    painter.save()
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    painter.setPen(Qt.PenStyle.NoPen)
+    painter.setBrush(QBrush(color))
+    for px, py in anchor_points:
+        painter.drawEllipse(px - radius, py - radius, radius * 2, radius * 2)
+    painter.restore()
 
 
 # ---------------------------------------------------------------------------
@@ -129,6 +192,7 @@ def render_shaped_text(
     direction: str = "ltr",
     fg_color: QColor = QColor(255, 255, 255),
     bg_color: QColor = QColor(30, 30, 30),
+    show_kerning_points: bool = False,
 ) -> QImage:
     """
     Render text using uharfbuzz for shaping and freetype for rasterization.
@@ -186,6 +250,15 @@ def render_shaped_text(
         if bitmap.rows > max_height:
             max_height = bitmap.rows
 
+        # Resolve the source character for this glyph via the cluster index.
+        # info.cluster is the byte offset into *text* for the first code-point
+        # that produced this glyph.  For BMP text this equals the char index.
+        cluster_idx = getattr(info, "cluster", 0)
+        try:
+            source_char = text[cluster_idx]
+        except (IndexError, TypeError):
+            source_char = ""
+
         glyphs_data.append({
             "index": gid,
             "x": gx,
@@ -194,6 +267,7 @@ def render_shaped_text(
             "bitmap": bitmap,
             "left": glyph.bitmap_left,
             "top": glyph.bitmap_top,
+            "char": source_char,
         })
 
         current_x += x_advance
@@ -230,6 +304,11 @@ def render_shaped_text(
     else:
         start_x = padding
 
+    # Dot color: soft red, semi-transparent — visible on both dark and light bg
+    anchor_color = QColor(255, 80, 80, 210)
+    # Scale dot radius with font size so it stays proportionate
+    dot_radius = max(2, int(font_size * 0.04))
+
     for gd in glyphs_data:
         ft_face.load_glyph(gd["index"])
         bitmap = gd["bitmap"]
@@ -255,6 +334,22 @@ def render_shaped_text(
             px = int(start_x + gd["x"] + gd["left"])
             py = int(baseline - gd["y"] - gd["top"])
             painter.drawImage(px, py, tinted)
+
+            # --- 6-point kerning anchor overlay ---
+            # Drawn only when guides are enabled AND the glyph maps to a
+            # Latin / Latin-1 Supplement character (U+0000–U+00FF).
+            if show_kerning_points and is_latin_character(gd.get("char", "")):
+                left_x  = px
+                right_x = px + bitmap.width
+                top_y    = py
+                bottom_y = py + bitmap.rows
+                draw_kerning_anchor_points(
+                    painter,
+                    left_x, right_x,
+                    top_y, bottom_y,
+                    color=anchor_color,
+                    radius=dot_radius,
+                )
 
     painter.end()
     return image
@@ -310,14 +405,20 @@ class PreviewRenderer:
         fg_color: QColor = QColor(255, 255, 255),
         bg_color: QColor = QColor(30, 30, 30),
     ) -> QImage:
-        """Render text to an image."""
-        
-        # When Kerning Pairs are active, we should inject them into Harfbuzz.
-        # However, modifying the harfbuzz font object's kerning requires a custom fontfuncs
-        # callback or exporting the font. Since `gui.py` applies the kerning to the `ufoLib2.Font`
-        # and re-compiles when exported, the "Live Preview" is approximated here or requires
-        # a live-recompile. For true shaping visualization, we rely on the shaped result.
-        
+        """
+        Render text to an image.
+
+        When *show_guides* is True, each Latin/Latin-Supplement character
+        receives 6 kerning reference dots (top/center/bottom on both the
+        left and right ink edges) to assist in evaluating pair accuracy.
+
+        Note on live kerning visualisation:
+            Harfbuzz shaping uses the compiled font's built-in kern table.
+            The auto-kern values are applied to `ufoLib2.Font` and only
+            become visible in the preview after an OTF re-export and reload.
+            The anchor dots are always drawn from the current rasterised
+            ink bounds regardless of kern state.
+        """
         return render_shaped_text(
             self.font_face,
             text,
@@ -325,4 +426,5 @@ class PreviewRenderer:
             direction=getattr(self, "direction", "ltr"),
             fg_color=fg_color,
             bg_color=bg_color,
+            show_kerning_points=show_guides,
         )

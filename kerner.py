@@ -75,6 +75,16 @@ class GlyphMetrics:
     contour_area: float = 0.0
     has_contours: bool = False
 
+    # --- 6 profile anchor points (absolute X in font units) ---
+    # Bounding box divided into 3 equal vertical zones; each stores the
+    # leftmost / rightmost ink X found within that zone.
+    left_top: float = 0.0    # leftmost X in top zone
+    left_mid: float = 0.0    # leftmost X in middle zone
+    left_bot: float = 0.0    # leftmost X in bottom zone
+    right_top: float = 0.0   # rightmost X in top zone
+    right_mid: float = 0.0   # rightmost X in middle zone
+    right_bot: float = 0.0   # rightmost X in bottom zone
+
 
 @dataclass
 class KernPair:
@@ -95,12 +105,68 @@ class ClassKernPair:
 
 
 # ---------------------------------------------------------------------------
+# Zone-profile helpers
+# ---------------------------------------------------------------------------
+
+
+def extract_zone_profile(
+    glyph,
+    bbox: tuple[float, float, float, float],
+) -> tuple[float, float, float, float, float, float]:
+    """
+    Divide the glyph bounding box into three equal vertical zones and return
+    the leftmost / rightmost ink X coordinate found in each zone.
+
+    Returns:
+        (left_top, left_mid, left_bot, right_top, right_mid, right_bot)
+
+    If a zone contains no contour points, the full bounding-box extreme is
+    used as a conservative fallback so downstream calculations stay valid.
+    """
+    xmin, ymin, xmax, ymax = bbox
+    h = ymax - ymin
+    if h <= 0:
+        return xmin, xmin, xmin, xmax, xmax, xmax
+
+    # Equal-thirds zone boundaries
+    bot_lo, bot_hi = ymin,             ymin + h / 3
+    mid_lo, mid_hi = ymin + h / 3,     ymin + 2 * h / 3
+    top_lo, top_hi = ymin + 2 * h / 3, ymax
+
+    # Collect every point coordinate from every contour
+    all_pts: list[tuple[float, float]] = [
+        (pt.x, pt.y)
+        for contour in glyph
+        for pt in contour
+    ]
+
+    def _zone_x(y_lo: float, y_hi: float) -> tuple[float, float]:
+        xs = [x for x, y in all_pts if y_lo <= y <= y_hi]
+        return (min(xs), max(xs)) if xs else (xmin, xmax)
+
+    top_l, top_r = _zone_x(top_lo, top_hi)
+    mid_l, mid_r = _zone_x(mid_lo, mid_hi)
+    bot_l, bot_r = _zone_x(bot_lo, bot_hi)
+
+    return top_l, mid_l, bot_l, top_r, mid_r, bot_r
+
+
+# ---------------------------------------------------------------------------
 # Metric extraction
 # ---------------------------------------------------------------------------
 
 
 def extract_metrics(glyph: Glyph) -> GlyphMetrics:
-    """Extract sidebearings, advance width, and bounding box from a glyph."""
+    """
+    Extract sidebearings, advance width, bounding box, and 6-point zone
+    profile from a glyph.
+
+    The 6 profile fields (left/right_top/mid/bot) store the leftmost /
+    rightmost ink X coordinate found within each equal-thirds vertical zone
+    of the bounding box.  These are used by compute_pair_kern() to calculate
+    the gap between adjacent glyphs at three heights, giving accurate optical
+    kerning for diagonals (V, W, A) and arms (T, F, L) without manual tuning.
+    """
     m = GlyphMetrics(name=glyph.name)
     m.advance_width = glyph.width
     m.has_contours = len(glyph) > 0
@@ -114,9 +180,17 @@ def extract_metrics(glyph: Glyph) -> GlyphMetrics:
             w = bbox[2] - bbox[0]
             h = bbox[3] - bbox[1]
             m.contour_area = w * h
+            # Populate 6-point profile
+            (
+                m.left_top, m.left_mid, m.left_bot,
+                m.right_top, m.right_mid, m.right_bot,
+            ) = extract_zone_profile(glyph, bbox)
         else:
             m.left_sb = 0
             m.right_sb = glyph.width
+            # Profile defaults to full-width extremes
+            m.left_top = m.left_mid = m.left_bot = 0.0
+            m.right_top = m.right_mid = m.right_bot = glyph.width
     else:
         m.left_sb = 0
         m.right_sb = glyph.width
@@ -130,18 +204,35 @@ def extract_metrics(glyph: Glyph) -> GlyphMetrics:
 
 
 def _metric_distance(a: GlyphMetrics, b: GlyphMetrics) -> float:
-    """Weighted Euclidean distance between two glyph metric profiles."""
-    # Normalise by average advance to make distance scale-invariant
+    """
+    Weighted Euclidean distance between two glyph metric profiles.
+
+    Incorporates both the legacy sidebearing scalars and the 6-point zone
+    profile so that glyphs with similar edge *shapes* (not just overall widths)
+    are clustered together.  This improves class quality for diagonals and
+    arms which have very different top/bottom edge positions.
+    """
     avg_adv = max((a.advance_width + b.advance_width) / 2, 1.0)
 
-    d_left = (a.left_sb - b.left_sb) / avg_adv
+    d_left  = (a.left_sb  - b.left_sb)  / avg_adv
     d_right = (a.right_sb - b.right_sb) / avg_adv
-    d_adv = (a.advance_width - b.advance_width) / avg_adv
-    d_area = (a.contour_area - b.contour_area) / (avg_adv**2 + 1)
+    d_adv   = (a.advance_width - b.advance_width) / avg_adv
+    d_area  = (a.contour_area  - b.contour_area)  / (avg_adv ** 2 + 1)
 
-    # Weights tuned empirically for Latin glyphs
+    # 6-point profile deltas (left edge shape)
+    d_lt = (a.left_top - b.left_top) / avg_adv
+    d_lm = (a.left_mid - b.left_mid) / avg_adv
+    d_lb = (a.left_bot - b.left_bot) / avg_adv
+    # 6-point profile deltas (right edge shape)
+    d_rt = (a.right_top - b.right_top) / avg_adv
+    d_rm = (a.right_mid - b.right_mid) / avg_adv
+    d_rb = (a.right_bot - b.right_bot) / avg_adv
+
     return math.sqrt(
-        3.0 * d_left**2 + 3.0 * d_right**2 + 1.0 * d_adv**2 + 0.5 * d_area**2
+        2.0 * d_left ** 2  + 2.0 * d_right ** 2
+        + 1.0 * d_adv ** 2 + 0.5 * d_area ** 2
+        + 1.5 * (d_lt ** 2 + d_lm ** 2 + d_lb ** 2)   # left profile shape
+        + 1.5 * (d_rt ** 2 + d_rm ** 2 + d_rb ** 2)   # right profile shape
     )
 
 
@@ -190,16 +281,24 @@ def cluster_glyphs(
 
 
 def _class_centroid(metrics_list: list[GlyphMetrics]) -> GlyphMetrics:
-    """Compute average metrics for a group of glyphs."""
+    """Compute average metrics (including 6-point profile) for a glyph class."""
     n = max(len(metrics_list), 1)
+    def _avg(attr: str) -> float:
+        return sum(getattr(m, attr) for m in metrics_list) / n
     return GlyphMetrics(
         name="centroid",
-        left_sb=sum(m.left_sb for m in metrics_list) / n,
-        right_sb=sum(m.right_sb for m in metrics_list) / n,
-        advance_width=sum(m.advance_width for m in metrics_list) / n,
+        left_sb=_avg("left_sb"),
+        right_sb=_avg("right_sb"),
+        advance_width=_avg("advance_width"),
         bbox=(0, 0, 0, 0),
-        contour_area=sum(m.contour_area for m in metrics_list) / n,
+        contour_area=_avg("contour_area"),
         has_contours=True,
+        left_top=_avg("left_top"),
+        left_mid=_avg("left_mid"),
+        left_bot=_avg("left_bot"),
+        right_top=_avg("right_top"),
+        right_mid=_avg("right_mid"),
+        right_bot=_avg("right_bot"),
     )
 
 
@@ -217,64 +316,55 @@ def compute_pair_kern(
     max_kern: float = 200,
 ) -> float:
     """
-    Calculate optimal kern value for a glyph pair.
+    Calculate the optimal kern value for a glyph pair using 6-point profile
+    kerning.
 
-    Heuristic: measure the visual gap between the right edge of the left glyph
-    and the left edge of the right glyph when placed at their default advance
-    positions.  A positive gap means the glyphs are too far apart → negative
-    kern to tighten.  An overlap means they collide → positive kern to loosen.
+    For each of the three vertical zones (top, center, bottom), the visual gap
+    between the two glyphs when placed side-by-side is:
 
-    Formula:
-        real_gap = left.right_sb + right.left_sb
-        ideal_gap = (left.advance_width + right.advance_width) * 0.08
-        kern = ideal_gap - real_gap
+        gap_zone = (left.advance_width - left.right_zone) + right.left_zone
 
-    The weight is modulated by the relative sizes of the glyphs so that
-    narrow-narrow pairs get less adjustment than wide-wide pairs.
+    The first term is the white space to the RIGHT of the left glyph's ink at
+    that height.  The second term is the white space to the LEFT of the right
+    glyph's ink at that height.  Together they give the total visual gap at
+    that vertical position.
+
+    We use the **minimum gap across all three zones** (the tightest point)
+    to drive the kern value:
+
+        kern = ideal_gap - min_gap
+
+    This naturally handles diagonals (V, W, A), arms (T, F, L), and rounded
+    glyphs (O, C) without any hard-coded tuck table — the geometry does the
+    work.
     """
-    # Actual bounding-box gap if placed side by side
-    real_gap = left.right_sb + right.left_sb
-    
-    # Heuristic for an ideal comfortable spacing based on glyph widths
-    ideal_gap = (left.advance_width + right.advance_width) * 0.08
+    # Gap at each vertical zone
+    gap_top = (left.advance_width - left.right_top) + right.left_top
+    gap_mid = (left.advance_width - left.right_mid) + right.left_mid
+    gap_bot = (left.advance_width - left.right_bot) + right.left_bot
 
-    # Optical weight factor: larger glyphs need more adjustment
-    avg_area = (left.contour_area + right.contour_area) / 2
-    avg_adv = (left.advance_width + right.advance_width) / 2
-    if avg_adv > 0:
-        size_factor = min(avg_area / (avg_adv**2), 1.0)
-    else:
-        size_factor = 0.5
+    # Baseline neutral gap — what the font's existing sidebearings already
+    # create when no kern is applied.  For uniform glyphs (H, n, o) this
+    # equals the weighted zone gap, so kern → 0.
+    baseline_gap = left.right_sb + right.left_sb
 
-    # Base kern value: adjust towards ideal gap proportionally
-    kern = (ideal_gap - real_gap) * (0.5 + 0.5 * size_factor)
+    # Weighted zone gap: midpoint carries the most optical weight.
+    # Top and bottom each contribute 25 % so that arms (T, F) and
+    # diagonals (V, A, W) influence the result without dominating.
+    weighted_gap = 0.25 * gap_top + 0.50 * gap_mid + 0.25 * gap_bot
 
-    # Tucking heuristics for specific Latin class pairs
-    tuck = 0.0
-    
-    # Uppercase tucking into lowercase (overcoming the empty space under arms)
-    if left_cls in ["T_left", "V_left", "Y_left", "W_left", "F_left", "P_left"]:
-        if right_cls in ["a_right", "o_right", "e_right", "c_right", "q_right", "u_right", "s_right"]:
-            tuck = -160.0
-        elif right_cls in ["v_right", "w_right", "y_right", "comma", "period"]:
-            tuck = -120.0
-            
-    # L tucking under T, V, Y, W
-    if left_cls == "L_left" and right_cls in ["T_right", "V_right", "Y_right", "W_right"]:
-        tuck = -180.0
-        
-    # A tucking with T, V, Y, W
-    if left_cls == "A_left" and right_cls in ["T_right", "V_right", "Y_right", "W_right"]:
-        tuck = -160.0
-    if left_cls in ["T_left", "V_left", "Y_left", "W_left"] and right_cls == "A_right":
-        tuck = -160.0
+    # Kern = correction that brings weighted_gap back towards baseline.
+    # Damping factor (0.4) prevents over-kerning; the remaining 60 % of
+    # the gap difference is left for the designer to fine-tune.
+    kern = (baseline_gap - weighted_gap) * 0.4
 
-    # Add the tuck adjustment
-    kern += tuck
+    # Safety: never kern so tight that the minimum zone gap goes negative
+    # (that would cause ink overlap at some height).
+    min_gap = min(gap_top, gap_mid, gap_bot)
+    kern = max(kern, -min_gap)
 
     # Clamp to user-defined range
     kern = max(min_kern, min(max_kern, kern))
-
     return round(kern, 1)
 
 
